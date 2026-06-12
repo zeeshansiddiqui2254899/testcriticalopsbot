@@ -1,0 +1,45 @@
+name: Critical Ops Bot
+
+on:
+  # Run every 6 hours — each run lasts ~5h30m and exits gracefully
+  schedule:
+    - cron: '0 */6 * * *'
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch: {}
+  # Run on push to main for instant restart when you update code
+  push:
+    branches: [main]
+
+concurrency:
+  group: bot
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # GitHub max is 360 min for a single job
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: npm install --omit=dev
+
+      - name: Run bot
+        env:
+          SLACK_BOT_TOKEN:           ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN:           ${{ secrets.SLACK_APP_TOKEN }}
+          ABACUSAI_API_KEY:          ${{ secrets.ABACUSAI_API_KEY }}
+          JIRA_HOST:                 ${{ secrets.JIRA_HOST }}
+          JIRA_EMAIL:                ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN:            ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY:          ${{ secrets.JIRA_PROJECT_KEY }}
+          SLACK_ALLOWED_CHANNEL_IDS: ${{ secrets.SLACK_ALLOWED_CHANNEL_IDS }}
+          INCIDENT_MIN_LENGTH:       '100'
+          MAX_RUN_MS:                '19800000'  # 5h30m — graceful exit before GH 6h limit
+        run: node bot.js
