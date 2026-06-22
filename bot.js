@@ -72,6 +72,115 @@ function adfFromText(text) {
   return { type: 'doc', version: 1, content: paragraphs.length ? paragraphs : [{ type: 'paragraph', content: [{ type: 'text', text: ' ' }] }] };
 }
 
+async function evolveDescription(originalMessage, currentDescription, threadReplies) {
+  const repliesText = threadReplies.map(r => `${r.author}: ${r.text}`).join('\n');
+  const prompt = `You are an incident management assistant. A Jira ticket was created from a Slack incident report. Since then, the team has been discussing the issue in the Slack thread. Your job is to UPDATE the Jira description to reflect new information from the discussion (root cause, fix, resolution, workaround, etc).
+
+Return ONLY the updated description as plain text. No JSON, no markdown headers, no code fences.
+
+Rules:
+- Keep the original sections (Issue, Impact, Steps to Reproduce, Expected Behavior, Actual Behavior, Affected Customers, Links/Evidence) if they were in the original.
+- ADD these sections at the bottom ONLY if the thread replies contain relevant info (skip empty ones):
+    Investigation Notes:
+    Root Cause:
+    Fix Applied / Resolution:
+    Workaround:
+    Status Update:
+- Use simple "- " bullets. No markdown (##, **, etc).
+- Do NOT invent facts. If thread replies don't discuss root cause / fix, don't add those sections.
+- Be concise. Each section should be 1-5 short bullets.
+- Preserve specific details: URLs, customer names, error messages, PR links, ticket numbers mentioned in replies.
+
+ORIGINAL INCIDENT MESSAGE:
+"""
+${originalMessage}
+"""
+
+CURRENT JIRA DESCRIPTION:
+"""
+${currentDescription}
+"""
+
+THREAD REPLIES (chronological):
+"""
+${repliesText}
+"""`;
+  const resp = await fetch('https://subcontractorhub.abacus.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ABACUSAI_API_KEY}` },
+    body: JSON.stringify({ model: 'route-llm', messages: [{ role: 'user', content: prompt }], stream: false }),
+  });
+  if (!resp.ok) throw new Error(`LLM API ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  const content = (data?.choices?.[0]?.message?.content || '').trim();
+  const cleaned = content.replace(/^```(?:text)?\s*/i, '').replace(/```\s*$/, '').trim();
+  if (!cleaned) throw new Error('Empty evolved description');
+  return cleaned;
+}
+
+// Extract plain text from Jira ADF
+function adfToText(adf) {
+  if (!adf) return '';
+  if (typeof adf === 'string') return adf;
+  let out = '';
+  function walk(node) {
+    if (!node) return;
+    if (node.type === 'text') { out += node.text || ''; return; }
+    if (node.type === 'hardBreak') { out += '\n'; return; }
+    if (Array.isArray(node.content)) node.content.forEach(walk);
+    if (node.type === 'paragraph') out += '\n';
+  }
+  walk(adf);
+  return out.trim();
+}
+
+async function updateJiraDescription(issueKey, newDescriptionText, channel, ts) {
+  // re-append dedupe marker so future searches still find it
+  const finalText = `${newDescriptionText}\n\n${slackMarker(channel, ts)}`;
+  await jira.put(`/issue/${issueKey}`, {
+    fields: { description: adfFromText(finalText) },
+  });
+}
+
+async function getJiraDescription(issueKey) {
+  try {
+    const resp = await jira.get(`/issue/${issueKey}`, { params: { fields: 'description' } });
+    return adfToText(resp.data?.fields?.description);
+  } catch (e) {
+    console.error('[evolve] get description failed:', e.response?.data || e.message);
+    return '';
+  }
+}
+
+async function evolveJiraForThread(jiraKey, channel, parentTs) {
+  try {
+    const thread = await getThread(channel, parentTs);
+    if (!thread.length) return;
+    const parent = thread[0];
+    const originalMessage = (parent.text || '').trim();
+    // gather replies (skip parent + bot/app messages + subtypes other than file_share)
+    const replies = [];
+    for (const m of thread) {
+      if (m.ts === parent.ts) continue;
+      if (m.bot_id || m.app_id) continue;
+      if (m.subtype && m.subtype !== 'file_share') continue;
+      const text = (m.text || '').trim();
+      if (!text) continue;
+      const author = await getDisplayName(m.user);
+      replies.push({ author, text });
+    }
+    if (!replies.length) return;
+    const currentDesc = await getJiraDescription(jiraKey);
+    // strip marker from current desc before sending to LLM (keeps prompt clean)
+    const cleanCurrent = currentDesc.replace(/\[slack-msg-id:[^\]]+\]/g, '').trim();
+    const evolved = await evolveDescription(originalMessage, cleanCurrent, replies);
+    await updateJiraDescription(jiraKey, evolved, channel, parentTs);
+    console.log(`[evolve] updated description of ${jiraKey} from ${replies.length} replies`);
+  } catch (e) {
+    console.error(`[evolve] failed for ${jiraKey}:`, e.response?.data || e.message);
+  }
+}
+
 async function generateIncidentContent(rawMessage) {
   const prompt = `You are an incident management assistant for an engineering operations team. An account manager just posted a rough incident report in Slack. Your job is to turn it into a clean Jira ticket.
 
@@ -285,6 +394,8 @@ async function syncReplyToJira(ev) {
   } catch (e) {
     console.error(`[comment] failed for ${jiraKey}:`, e.message);
   }
+  // After syncing the comment, evolve the description with any new info
+  await evolveJiraForThread(jiraKey, ev.channel, ev.thread_ts);
 }
 
 // SAFEGUARD #3 — Startup catchup: scan recent threads and sync any missed replies
@@ -296,11 +407,12 @@ async function catchupMissedReplies() {
   for (const channel of SLACK_ALLOWED_CHANNEL_IDS) {
     try {
       const hist = await slack.conversations.history({ channel, oldest, limit: 200 });
-      const parents = (hist.messages || []).filter(m => m.reply_count && m.reply_count > 0 && !m.subtype);
+      const parents = (hist.messages || []).filter(m => m.reply_count && m.reply_count > 0 && (!m.subtype || m.subtype === 'file_share'));
       for (const parent of parents) {
         const thread = await getThread(channel, parent.ts);
         const jiraKey = findJiraKeyInThread(thread);
         if (!jiraKey) continue;
+        let syncedAny = false;
         // process replies (skip parent itself)
         for (const reply of thread) {
           if (reply.ts === parent.ts) continue;
@@ -314,9 +426,13 @@ async function catchupMissedReplies() {
           try {
             await addJiraComment(jiraKey, replyText, displayName, reply.ts);
             console.log(`[catchup] synced missed reply to ${jiraKey} from ${displayName}`);
+            syncedAny = true;
           } catch (e) {
             console.error(`[catchup] failed for ${jiraKey}:`, e.message);
           }
+        }
+        if (syncedAny) {
+          await evolveJiraForThread(jiraKey, channel, parent.ts);
         }
       }
     } catch (e) {
