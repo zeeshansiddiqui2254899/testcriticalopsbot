@@ -18,7 +18,7 @@ const SLACK_ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const INCIDENT_MIN_LENGTH = parseInt(process.env.INCIDENT_MIN_LENGTH || '100', 10);
 const MAX_RUN_MS = parseInt(process.env.MAX_RUN_MS || String(5.5 * 60 * 60 * 1000), 10);
-const CATCHUP_LOOKBACK_HOURS = parseFloat(process.env.CATCHUP_LOOKBACK_HOURS || '2');
+const CATCHUP_LOOKBACK_HOURS = parseFloat(process.env.CATCHUP_LOOKBACK_HOURS || '168'); // 7 days
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !ABACUSAI_API_KEY ||
     !JIRA_HOST || !JIRA_EMAIL || !JIRA_API_TOKEN) {
@@ -141,9 +141,6 @@ async function createJiraIncident({ summary, description, rawMessage, slackPerma
   if (slackPermalink) parts.push(`Slack thread: ${slackPermalink}`);
   if (parts.length) parts.push('');
   parts.push(description);
-  if (rawMessage && rawMessage.trim() !== description.trim()) {
-    parts.push('', '--- Original Slack message ---', rawMessage);
-  }
   // embed dedupe marker (invisible-ish, at bottom)
   parts.push('', slackMarker(channel, ts));
   const payload = {
