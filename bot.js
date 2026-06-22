@@ -216,8 +216,21 @@ async function postIncidentCreated(channel, thread_ts, jiraKey, jiraUrl, summary
   });
 }
 
+function extractFileUrls(ev) {
+  const files = ev.files || [];
+  return files.map(f => {
+    const url = f.url_private || f.permalink || '';
+    const name = f.name || f.title || 'file';
+    return url ? `- ${name}: ${url}` : '';
+  }).filter(Boolean);
+}
+
 async function handleTopLevel(ev) {
-  const text = (ev.text || '').trim();
+  let text = (ev.text || '').trim();
+  const fileLines = extractFileUrls(ev);
+  if (fileLines.length) {
+    text = (text ? text + '\n\n' : '') + 'Attached files:\n' + fileLines.join('\n');
+  }
   if (text.length < INCIDENT_MIN_LENGTH) return;
   console.log(`[incident] qualifying msg ch=${ev.channel} user=${ev.user} len=${text.length}`);
 
@@ -326,7 +339,8 @@ socket.on('message', async ({ event, ack }) => {
   try {
     const ev = event;
     if (!ev || ev.type !== 'message') return;
-    if (ev.subtype) return;
+    // Allow file_share (message with attached image/file). Skip other subtypes (edits, deletes, joins, etc.)
+    if (ev.subtype && ev.subtype !== 'file_share') return;
     if (ev.bot_id || ev.app_id) return;
     const id = ev.client_msg_id || `${ev.channel}-${ev.ts}`;
     if (!markProcessed(id)) return;
