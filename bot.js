@@ -18,7 +18,8 @@ const SLACK_ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const INCIDENT_MIN_LENGTH = parseInt(process.env.INCIDENT_MIN_LENGTH || '100', 10);
 const MAX_RUN_MS = parseInt(process.env.MAX_RUN_MS || String(5.75 * 60 * 60 * 1000), 10); // 5h45m — minimizes gap before next 6h cron
-const CATCHUP_LOOKBACK_HOURS = parseFloat(process.env.CATCHUP_LOOKBACK_HOURS || '168'); // 7 days
+const CATCHUP_LOOKBACK_HOURS = parseFloat(process.env.CATCHUP_LOOKBACK_HOURS || '168'); // 7 days (for thread replies)
+const CATCHUP_PARENT_HOURS = parseFloat(process.env.CATCHUP_PARENT_HOURS || '6'); // only create tickets for parents missed in last 6h (avoids recreating old/historical tickets)
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !ABACUSAI_API_KEY ||
     !JIRA_HOST || !JIRA_EMAIL || !JIRA_API_TOKEN) {
@@ -404,14 +405,17 @@ async function catchupMissedMessages() {
   const oldest = ((Date.now() - CATCHUP_LOOKBACK_HOURS * 3600 * 1000) / 1000).toFixed(6);
   console.log(`[catchup] scanning last ${CATCHUP_LOOKBACK_HOURS}h for missed messages + replies...`);
 
-  // PART A: Catch missed parent messages (create tickets)
+  // PART A: Catch missed parent messages (create tickets) — ONLY within the short parent window
+  const parentOldestMs = Date.now() - CATCHUP_PARENT_HOURS * 3600 * 1000;
+  const parentOldest = (parentOldestMs / 1000).toFixed(6);
   for (const channel of SLACK_ALLOWED_CHANNEL_IDS) {
     try {
-      const hist = await slack.conversations.history({ channel, oldest, limit: 200 });
+      const hist = await slack.conversations.history({ channel, oldest: parentOldest, limit: 200 });
       const messages = (hist.messages || []).filter(m => {
         if (m.bot_id || m.app_id) return false;
         if (m.subtype && m.subtype !== 'file_share') return false;
         if (m.thread_ts && m.thread_ts !== m.ts) return false; // skip replies
+        if (parseFloat(m.ts) * 1000 < parentOldestMs) return false; // hard guard on window
         return true;
       });
       for (const msg of messages) {
