@@ -1,9 +1,9 @@
 name: Critical Ops Bot
 
 on:
-  # Run every 6 hours — each run lasts ~5h30m and exits gracefully
+  # Run every 5 hours to minimize gaps between runs
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 0,5,10,15,20 * * *'
   # Allow manual trigger from the Actions tab
   workflow_dispatch: {}
   # Run on push to main for instant restart when you update code
@@ -41,5 +41,5 @@ jobs:
           JIRA_PROJECT_KEY:          ${{ secrets.JIRA_PROJECT_KEY }}
           SLACK_ALLOWED_CHANNEL_IDS: ${{ secrets.SLACK_ALLOWED_CHANNEL_IDS }}
           INCIDENT_MIN_LENGTH:       '100'
-          MAX_RUN_MS:                '19800000'  # 5h30m — graceful exit before GH 6h limit
+          MAX_RUN_MS:                '17400000'  # 4h50m — exits before next 5h cron trigger
         run: node bot.js

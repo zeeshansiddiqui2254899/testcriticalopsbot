@@ -17,7 +17,7 @@ const JIRA_ISSUE_TYPE = process.env.JIRA_ISSUE_TYPE || 'Task';
 const SLACK_ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const INCIDENT_MIN_LENGTH = parseInt(process.env.INCIDENT_MIN_LENGTH || '100', 10);
-const MAX_RUN_MS = parseInt(process.env.MAX_RUN_MS || String(5.5 * 60 * 60 * 1000), 10);
+const MAX_RUN_MS = parseInt(process.env.MAX_RUN_MS || String(5.75 * 60 * 60 * 1000), 10); // 5h45m — minimizes gap before next 6h cron
 const CATCHUP_LOOKBACK_HOURS = parseFloat(process.env.CATCHUP_LOOKBACK_HOURS || '168'); // 7 days
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !ABACUSAI_API_KEY ||
@@ -398,11 +398,54 @@ async function syncReplyToJira(ev) {
   await evolveJiraForThread(jiraKey, ev.channel, ev.thread_ts);
 }
 
-// SAFEGUARD #3 — Startup catchup: scan recent threads and sync any missed replies
-async function catchupMissedReplies() {
+// SAFEGUARD #3 — Startup catchup: scan for missed parent messages AND thread replies
+async function catchupMissedMessages() {
   if (SLACK_ALLOWED_CHANNEL_IDS.length === 0) return;
   const oldest = ((Date.now() - CATCHUP_LOOKBACK_HOURS * 3600 * 1000) / 1000).toFixed(6);
-  console.log(`[catchup] scanning last ${CATCHUP_LOOKBACK_HOURS}h for missed replies...`);
+  console.log(`[catchup] scanning last ${CATCHUP_LOOKBACK_HOURS}h for missed messages + replies...`);
+
+  // PART A: Catch missed parent messages (create tickets)
+  for (const channel of SLACK_ALLOWED_CHANNEL_IDS) {
+    try {
+      const hist = await slack.conversations.history({ channel, oldest, limit: 200 });
+      const messages = (hist.messages || []).filter(m => {
+        if (m.bot_id || m.app_id) return false;
+        if (m.subtype && m.subtype !== 'file_share') return false;
+        if (m.thread_ts && m.thread_ts !== m.ts) return false; // skip replies
+        return true;
+      });
+      for (const msg of messages) {
+        let text = (msg.text || '').trim();
+        const fileLines = extractFileUrls(msg);
+        if (fileLines.length) {
+          text = (text ? text + '\n\n' : '') + 'Attached files:\n' + fileLines.join('\n');
+        }
+        if (text.length < INCIDENT_MIN_LENGTH) continue;
+        // Check if ticket already exists for this message
+        const existing = await findExistingTicketForMessage(channel, msg.ts);
+        if (existing) continue;
+        console.log(`[catchup] found missed parent message from ${msg.user} at ${msg.ts}`);
+        try {
+          const displayName = await getDisplayName(msg.user);
+          const permalink = await getPermalink(channel, msg.ts);
+          const { summary, description } = await generateIncidentContent(text);
+          const ticket = await createJiraIncident({
+            summary, description, rawMessage: text,
+            slackPermalink: permalink, slackUser: displayName,
+            channel, ts: msg.ts,
+          });
+          console.log(`[catchup] created ticket ${ticket.key} for missed message`);
+          await postIncidentCreated(channel, msg.ts, ticket.key, ticket.url, summary);
+        } catch (e) {
+          console.error(`[catchup] failed to create ticket for missed msg:`, e.message);
+        }
+      }
+    } catch (e) {
+      console.error(`[catchup] channel ${channel} parent scan failed:`, e.response?.data || e.message);
+    }
+  }
+
+  // PART B: Catch missed thread replies (sync comments + evolve description)
 
   for (const channel of SLACK_ALLOWED_CHANNEL_IDS) {
     try {
@@ -443,7 +486,7 @@ async function catchupMissedReplies() {
 }
 
 socket.on('connecting', () => console.log('Socket Mode: connecting...'));
-socket.on('connected',  () => { console.log('Socket Mode: connected ✅'); catchupMissedReplies().catch(e => console.error('catchup err:', e.message)); });
+socket.on('connected',  () => { console.log('Socket Mode: connected ✅'); catchupMissedMessages().catch(e => console.error('catchup err:', e.message)); });
 socket.on('disconnected', () => console.log('Socket Mode: disconnected'));
 socket.on('error', (err) => console.error('Socket Mode error:', err?.message || err));
 
