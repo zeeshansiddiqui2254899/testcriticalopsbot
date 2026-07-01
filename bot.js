@@ -234,13 +234,16 @@ async function findExistingTicketForMessage(channel, ts) {
   const marker = slackMarker(channel, ts);
   const jql = `project = ${JIRA_PROJECT_KEY} AND description ~ "${marker.replace(/"/g, '\\"')}"`;
   try {
-    const resp = await jira.get('/search', { params: { jql, fields: 'summary', maxResults: 1 } });
+    // Atlassian removed /search (HTTP 410). Use /search/jql instead.
+    const resp = await jira.get('/search/jql', { params: { jql, fields: 'summary', maxResults: 5 } });
     const issues = resp.data?.issues || [];
     if (issues.length > 0) {
       return { key: issues[0].key, url: `https://${JIRA_HOST}/browse/${issues[0].key}` };
     }
   } catch (e) {
     console.error('[dedupe] Jira search failed:', e.response?.data || e.message);
+    // Fail-safe: if we cannot verify, do NOT create a ticket (prevents duplicates)
+    throw new Error('dedupe-check-failed');
   }
   return null;
 }
@@ -425,8 +428,15 @@ async function catchupMissedMessages() {
           text = (text ? text + '\n\n' : '') + 'Attached files:\n' + fileLines.join('\n');
         }
         if (text.length < INCIDENT_MIN_LENGTH) continue;
-        // Check if ticket already exists for this message
-        const existing = await findExistingTicketForMessage(channel, msg.ts);
+        // Check if ticket already exists for this message.
+        // If the dedupe check itself fails, SKIP creating (fail-safe against duplicates).
+        let existing;
+        try {
+          existing = await findExistingTicketForMessage(channel, msg.ts);
+        } catch (e) {
+          console.error(`[catchup] dedupe check failed for ts=${msg.ts}, skipping to avoid duplicate.`);
+          continue;
+        }
         if (existing) continue;
         console.log(`[catchup] found missed parent message from ${msg.user} at ${msg.ts}`);
         try {
